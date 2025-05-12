@@ -1,116 +1,98 @@
 #!/usr/bin/env python3
 """
- demo_story_gen.py  ·  voice → anime‑style slideshow → narrated MP4
- --------------------------------------------------------------------
- A minimal, single‑file demo that shows every step of the pipeline so you can
- measure latency *and* see what each API call costs you in real dollars.
+ demo_story_gen.py  ·  *v3*  — high‑quality manga stills only
+ -------------------------------------------------------------
+ Fixes from feedback  ❯❯❯
+   1. Use **cjwbw/waifu‑diffusion** model on Replicate for sharper manga art.
+   2. GPT now returns a **Danbooru‑style tag prompt** (15‑25 tags) per scene so
+     every image call is richly described.
+   3.  (Optional) You can still build a video, but the default `--stills` flag
+      dumps only the PNGs and narration MP3s.
 
- 1. (Optional) Whisper STT             – OpenAI     – $0.006 / audio‑min
- 2. Story + 6 scene prompts            – GPT‑4o‑mini– $0.0002 / story
- 3. Anime stills (6 × 512 px)          – Stability  – $0.002  / image (REST, no gRPC)
- 4. Narration (TTS)                    – ElevenLabs – $0.015 / 1K chars
- 5. Video mux (local ffmpeg/moviepy)   – free CPU
- --------------------------------------------------------------------
- Quick‑start install (Python 3.9‑3.12):
-     pip install openai elevenlabs moviepy python-dotenv requests tqdm
- #            ↑ no stability-sdk ⇒ avoids heavy grpcio build
+ Quick install:
+   pip install openai elevenlabs python-dotenv requests tqdm replicate moviepy
 
- Environment variables (edit your .env):
-     OPENAI_API_KEY=sk‑…
-     STABILITY_API_KEY=prodsecret‑…
-     ELEVEN_API_KEY=elev‑…
+ .env (3 keys – same as before):
+   OPENAI_API_KEY=sk‑…
+   ELEVEN_API_KEY=elev‑…
+   REPLICATE_API_TOKEN=r8_…
 
- Text‑only prompt demo:
-     python demo_story_gen.py -t "A brave cat‑girl ninja rescues a pizza chef on the moon"
+ Example  –  just export the stills (no video build):
+   python demo_story_gen.py -t "A cat‑girl ninja rescues a pizza chef on the moon" \
+      --stills
 
- Recorded‑audio demo:
-     python demo_story_gen.py --audio my_prompt.wav
-
- This creates:
-     out/scene‑0.png … scene‑5.png   (anime stills)
-     out/narration.mp3               (TTS)
-     out/story.mp4                   (30‑fps MP4 slideshow)
-
- End‑to‑end variable spend ≈ 2–3 ¢ / story.
+ Example  –  full narrated video:
+   python demo_story_gen.py -t "A shy dragon learns violin" --video
 """
 
-import argparse, json, os, time
+import argparse, json, os, tempfile, time
 from pathlib import Path
+from typing import List
 
 import openai, requests
 from dotenv import load_dotenv
 from tqdm import tqdm
 
-# ---------- config ----------
-SCENES = 6                  # how many still frames per story
-IMAGE_RES = 512             # px (square)
+# ----- constants ------------------------------------------------------------
+MODEL_REPLICATE = "cjwbw/waifu-diffusion"  # sharper manga look
+IMAGE_RES = 512
+TAG_COUNT = (15, 25)                       # min, max Danbooru tags per scene
 
-# ---------- helpers ----------
+# ----- helpers --------------------------------------------------------------
 
 def usd(x: float) -> str:
     return f"${x:.4f}"
 
-# ---------- pipeline steps ----------
+# ----- GPT: scene → Danbooru tag prompt -------------------------------------
 
-# 1 ▸ Speech‑to‑text ---------------------------------------------------------
-
-def transcribe_whisper(audio_path: str) -> str:
-    """Return plain‑text transcription using OpenAI Whisper API."""
-    with open(audio_path, "rb") as f:
-        start = time.time()
-        resp = openai.audio.transcriptions.create(
-            model="whisper-1", file=f, response_format="text"
+def story_to_scenes(prompt: str, n: int | None) -> List[dict]:
+    if n is None:
+        system = (
+            "You are a manga storyboarder. Split the user prompt into an ordered "
+            "list of short scenes (4‑10). For each scene output JSON with: "
+            "'tags' (comma‑separated Danbooru tags, 15‑25 items) and 'subtitle' (≤20 words)."
         )
-    print(f"Whisper latency: {time.time() - start:.2f}s")
-    return resp.text.strip()
-
-# 2 ▸ Story + scene JSON ------------------------------------------------------
-
-def storybeats(user_prompt: str, scenes: int = SCENES):
-    """Ask GPT‑4o‑mini for structured JSON describing N scenes."""
-    system = (
-        "You are a children's storyteller. Split the user prompt into exactly "
-        f"{scenes} sequential scenes. Return JSON {{\"scenes\": [{{\"prompt\", \"subtitle\"}}]}}"
-    )
+    else:
+        system = (
+            f"You are a manga storyboarder. Split the user prompt into exactly {n} scenes. "
+            "Return JSON list of {'tags', 'subtitle'} as above."
+        )
     resp = openai.chat.completions.create(
         model="gpt-4o-mini",
         temperature=0.7,
-        max_tokens=400,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user_prompt},
-        ],
+        max_tokens=700,
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}],
         response_format={"type": "json_object"},
     )
-    return json.loads(resp.choices[0].message.content)["scenes"]
+    return json.loads(resp.choices[0].message.content)
 
-# 3 ▸ Anime stills (REST call, no stability-sdk) -----------------------------
+# ----- Replicate call --------------------------------------------------------
 
-def generate_image(prompt: str, out_path: Path):
-    """Generate a single image via Stability *core* endpoint (multipart/form‑data)."""
-    url = "https://api.stability.ai/v2beta/stable-image/generate/core"
+def gen_image_tags(tags: str) -> bytes:
+    import replicate, requests as rq
 
-    headers = {
-        "Authorization": f"Bearer {os.getenv('STABILITY_API_KEY')}",
-        "Accept": "image/*",                   # png or webp returned
-    }
+    # grab the model’s latest version id on the fly
+    version = replicate.models.get("cjwbw/waifu-diffusion").latest_version.id
 
-    # `core` insists on multipart/form‑data *plus* a dummy `files` field.
-    files = {"none": ""}                         # <= required placeholder
-    data = {
-        "prompt": prompt,
-        "output_format": "png",                 # or "webp" (smaller)
-    }
+    out = replicate.run(
+        f"cjwbw/waifu-diffusion:{version}",
+        input={
+            "prompt": tags,
+            "width": IMAGE_RES,
+            "height": IMAGE_RES,
+            "num_inference_steps": 50,
+            "guidance_scale": 6,
+            "scheduler": "k_euler",
+            "negative_prompt": "lowres, bad anatomy, bad hands, text",
+        },
+    )
+    url = out[0] if isinstance(out, list) else out
+    return rq.get(url).content
 
-    r = requests.post(url, headers=headers, files=files, data=data, timeout=60)
-    if r.status_code != 200:
-        raise RuntimeError(f"Stability error {r.status_code}: {r.text}")
 
-    out_path.write_bytes(r.content)
+# ----- ElevenLabs TTS per scene ---------------------------------------------
 
-# 4 ▸ Text‑to‑speech ---------------------------------------------------------
-
-def tts(text: str, out_path: Path):
+def tts_clip(text: str, tmp: Path) -> Path:
     from elevenlabs import generate, save
 
     audio = generate(
@@ -119,62 +101,72 @@ def tts(text: str, out_path: Path):
         voice=os.getenv("ELEVEN_VOICE_ID", "21m00Tcm4TlvDq8ikWAM"),
         text=text,
     )
-    save(audio, out_path)
+    out = tmp / f"{abs(hash(text))}.mp3"
+    save(audio, out)
+    return out
 
-# 5 ▸ Assemble video ---------------------------------------------------------
+# ----- Optional video combine ----------------------------------------------
 
-def mux_video(images_dir: Path, audio_path: Path, out_path: Path):
-    from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips
+def build_video(images: List[Path], audios: List[Path], outfile: Path):
+    from moviepy.editor import ImageClip, AudioFileClip, concatenate_audioclips, concatenate_videoclips
 
-    imgs = sorted(images_dir.glob("scene-*.png"))
-    audio = AudioFileClip(str(audio_path))
-    per = audio.duration / len(imgs)
+    aud_clips = [AudioFileClip(str(p)) for p in audios]
+    full_audio = concatenate_audioclips(aud_clips)
+    video_clips = [ImageClip(str(img)).set_duration(ac.duration)
+                   for img, ac in zip(images, aud_clips)]
+    concatenate_videoclips(video_clips, method="compose").set_audio(full_audio)\
+        .write_videofile(str(outfile), fps=30, codec="libx264", audio_codec="aac", logger=None)
 
-    clips = [ImageClip(str(p)).set_duration(per) for p in imgs]
-    concatenate_videoclips(clips, method="compose")\
-        .set_audio(audio)\
-        .write_videofile(str(out_path), fps=30, codec="libx264", audio_codec="aac", logger=None)
-
-# ---------- main CLI ----------
+# ----- main -----------------------------------------------------------------
 
 def main():
     load_dotenv()
-    parser = argparse.ArgumentParser(description="End‑to‑end anime story generator demo")
-    g = parser.add_mutually_exclusive_group(required=True)
-    g.add_argument("-t", "--text", metavar="PROMPT", help="Raw text prompt")
-    g.add_argument("-a", "--audio", metavar="WAV", help="Path to WAV for Whisper transcription")
-    parser.add_argument("-o", "--out", default="out", help="Output directory [out]")
-    args = parser.parse_args()
+
+    ap = argparse.ArgumentParser(description="Generate manga‑style stills (+optional video)")
+    g = ap.add_mutually_exclusive_group(required=True)
+    g.add_argument("-t", "--text", help="raw prompt")
+    g.add_argument("-a", "--audio", help="WAV for Whisper STT")
+    ap.add_argument("--scenes", type=int, help="force scene count")
+    ap.add_argument("--video", action="store_true", help="also build MP4 video")
+    ap.add_argument("--stills", action="store_true", help="only export PNG + MP3 (default)")
+    ap.add_argument("-o", "--out", default="out", help="output directory")
+    args = ap.parse_args()
+    if not args.video: args.stills = True
 
     out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(exist_ok=True)
 
-    # ▸ Step 1
-    user_prompt = transcribe_whisper(args.audio) if args.audio else args.text
-    print("User prompt:", user_prompt)
+    # 1. prompt (or Whisper)
+    if args.audio:
+        with open(args.audio, "rb") as f:
+            prompt_txt = openai.audio.transcriptions.create(model="whisper-1", file=f, response_format="text").text
+    else:
+        prompt_txt = args.text
+    print("Prompt:", prompt_txt)
 
-    # ▸ Step 2
-    scenes = storybeats(user_prompt)
-    print("Got", len(scenes), "scenes from GPT‑4o‑mini")
+    # 2. GPT scene → tags/subtitle
+    scenes = story_to_scenes(prompt_txt, args.scenes)
+    scenes = scenes["scenes"]
+    print(f"GPT returned {len(scenes)} scenes")
 
-    # ▸ Step 3  – anime stills
-    for i, scene in enumerate(tqdm(scenes, desc="Generating images")):
-        generate_image(scene["prompt"], out_dir / f"scene-{i}.png")
+    # 3. Generate images + per‑scene TTS
+    tmp_aud = tempfile.TemporaryDirectory()
+    img_paths, aud_paths = [], []
+    for i, sc in enumerate(tqdm(scenes, desc="Scenes")):
+        img_bin = gen_image_tags(sc["tags"])
+        img_path = out_dir / f"scene-{i}.png"
+        img_path.write_bytes(img_bin)
+        img_paths.append(img_path)
 
-    # ▸ Step 4  – narration TTS
-    script_text = " ".join(s["subtitle"] for s in scenes)
-    audio_path = out_dir / "narration.mp3"
-    tts(script_text, audio_path)
+        aud_paths.append(tts_clip(sc["subtitle"], Path(tmp_aud.name)))
 
-    # ▸ Step 5  – mux
-    video_path = out_dir / "story.mp4"
-    mux_video(out_dir, audio_path, video_path)
-
-    # ▸ Rough cost printout
-    cost_imgs = 0.002 * len(scenes)
-    cost_tts = 0.015 * (len(script_text) / 1000)
-    print("\nFinished! Video saved →", video_path)
-    print("Approx cost this run → Images", usd(cost_imgs), "+ TTS", usd(cost_tts))
+    # 4. Optional video
+    if args.video:
+        mp4 = out_dir / "story.mp4"
+        build_video(img_paths, aud_paths, mp4)
+        print("Saved video →", mp4)
+    else:
+        print("Done. PNG + MP3 clips saved in", out_dir)
 
 
 if __name__ == "__main__":
